@@ -1,0 +1,291 @@
+"""Hermes chat session: a relay to the Hermes dashboard's PTY channel.
+
+The Hermes dashboard (Nous Research) serves its chat as a terminal UI
+over a WebSocket at ``/api/pty``. Authentication is a cookie session
+after a form login, plus a single-use, short-lived ticket minted for
+each WebSocket connection:
+
+  1. ``POST /auth/password-login`` (form: username + password)
+     -> session cookie.
+  2. ``POST /api/auth/ws-ticket`` (with the cookie) -> ``{"ticket": ...}``.
+  3. Connect ``ws://<host>:<port>/api/pty?ticket=<ticket>`` (plus
+     ``&profile=<name>`` to pick a Hermes profile).
+
+This module owns one such connection: input bytes go to the Hermes PTY,
+output bytes arrive via the ``on_output`` callback, and the session
+closes (firing ``on_exit``) when Hermes drops the socket. Tickets are
+single-use, so a reconnect must mint a fresh one — this class does not
+auto-reconnect; the caller creates a new session instead.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+
+import aiohttp
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class HermesSession:
+    """One chat session on the Hermes dashboard's PTY channel."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        profile: str,
+        on_output,
+        on_exit=None,
+    ) -> None:
+        self._loop = loop
+        self._host = host
+        self._port = int(port)
+        self._username = username
+        self._password = password
+        self._profile = profile or "default"
+        self._on_output = on_output
+        self._on_exit = on_exit
+        self._session: aiohttp.ClientSession | None = None
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._read_task: asyncio.Task | None = None
+        self._closed = False
+        self._exit_reported = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _base_url(self) -> str:
+        return f"http://{self._host}:{self._port}"
+
+    async def _login(self, session: aiohttp.ClientSession) -> bool:
+        """Log in to Hermes and keep the session cookie in the jar."""
+        url = f"{self._base_url()}/auth/password-login"
+        try:
+            async with session.post(
+                url,
+                data={"username": self._username, "password": self._password},
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                # A successful login sets a session cookie and either
+                # returns 200 or redirects (302) to the dashboard.
+                _LOGGER.debug("Hermes login: %s -> %s", url, resp.status)
+                if resp.status in (200, 302, 303):
+                    return True
+                body = await resp.text()
+                _LOGGER.warning(
+                    "Hermes login failed: status=%s body=%s",
+                    resp.status,
+                    body[:200],
+                )
+                return False
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            _LOGGER.warning("Hermes login error: %s", err)
+            return False
+
+    async def _mint_ticket(self, session: aiohttp.ClientSession) -> str | None:
+        """Mint a single-use WebSocket ticket (30 s TTL)."""
+        url = f"{self._base_url()}/api/auth/ws-ticket"
+        try:
+            async with session.post(
+                url, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    _LOGGER.warning(
+                        "Hermes ws-ticket failed: status=%s body=%s",
+                        resp.status,
+                        body[:200],
+                    )
+                    return None
+                data = await resp.json(content_type=None)
+                ticket = (data or {}).get("ticket")
+                if not ticket:
+                    _LOGGER.warning("Hermes ws-ticket: no ticket in %s", str(data)[:200])
+                    return None
+                return ticket
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            _LOGGER.warning("Hermes ws-ticket error: %s", err)
+            return None
+
+    async def start(self) -> None:
+        """Log in, mint a ticket, and open the Hermes PTY channel.
+
+        Raises RuntimeError with a human-readable message when any step
+        fails, so the caller can report it to the browser.
+        """
+        session = aiohttp.ClientSession(trust_env=True)
+        self._session = session
+        try:
+            if not await self._login(session):
+                raise RuntimeError("Hermes login failed — check host, username and password")
+            ticket = await self._mint_ticket(session)
+            if not ticket:
+                raise RuntimeError("Hermes would not issue a chat ticket — check the Hermes login")
+            ws_url = (
+                f"ws://{self._host}:{self._port}/api/pty"
+                f"?ticket={ticket}&profile={self._profile}"
+            )
+            _LOGGER.debug("Hermes PTY: connecting (profile=%s)", self._profile)
+            try:
+                self._ws = await session.ws_connect(
+                    ws_url, timeout=aiohttp.ClientTimeout(total=15)
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                raise RuntimeError(f"Could not open the Hermes chat channel: {err}") from err
+            _LOGGER.info(
+                "Hermes chat connected: %s:%s profile=%s",
+                self._host,
+                self._port,
+                self._profile,
+            )
+            self._read_task = self._loop.create_task(self._read_loop())
+        except Exception:
+            await self._close_resources()
+            raise
+
+    async def _read_loop(self) -> None:
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            async for msg in ws:
+                if self._closed:
+                    break
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    self._emit(msg.data)
+                elif msg.type == aiohttp.WSMsgType.TEXT:
+                    # Hermes may send text frames; the terminal wants
+                    # bytes, so encode them.
+                    try:
+                        self._emit(msg.data.encode("utf-8"))
+                    except Exception:  # noqa: BLE001 - a bad frame must not kill the loop
+                        pass
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                    break
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    _LOGGER.debug("Hermes PTY error: %s", ws.exception())
+                    break
+        except (aiohttp.ClientError, asyncio.CancelledError):
+            pass
+        finally:
+            self._loop.call_soon(self._report_exit)
+
+    def _emit(self, data: bytes) -> None:
+        if not data:
+            return
+        try:
+            self._on_output(data)
+        except Exception:  # noqa: BLE001 - a dead transport must not kill the reader
+            _LOGGER.debug("Hermes output callback failed", exc_info=True)
+
+    def _report_exit(self) -> None:
+        if self._exit_reported:
+            return
+        self._exit_reported = True
+        if self._on_exit is not None:
+            try:
+                self._on_exit(None)
+            except Exception:  # noqa: BLE001 - never raise out of the reader
+                _LOGGER.debug("Hermes exit callback failed", exc_info=True)
+
+    def write_input(self, data: bytes) -> None:
+        """Send keystrokes to the Hermes PTY."""
+        if self._closed or self._ws is None or self._ws.closed or not data:
+            return
+        try:
+            asyncio.ensure_future(self._ws.send_bytes(data))
+        except Exception:  # noqa: BLE001 - peer gone
+            pass
+
+    def resize(self, cols: int, rows: int) -> None:
+        """Tell the Hermes PTY the terminal size changed.
+
+        Best effort: Hermes may ignore an unknown message, so a failure
+        here never raises.
+        """
+        if self._closed or self._ws is None or self._ws.closed:
+            return
+        if cols < 1 or rows < 1:
+            return
+        try:
+            asyncio.ensure_future(
+                self._ws.send_str(
+                    json.dumps({"type": "resize", "cols": int(cols), "rows": int(rows)})
+                )
+            )
+        except Exception:  # noqa: BLE001 - resize is best effort
+            pass
+
+    async def _close_resources(self) -> None:
+        if self._read_task is not None:
+            self._read_task.cancel()
+            try:
+                await self._read_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - already closing
+                pass
+            self._read_task = None
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001 - already closing
+                pass
+            self._ws = None
+        if self._session is not None:
+            try:
+                await self._session.close()
+            except Exception:  # noqa: BLE001 - already closing
+                pass
+            self._session = None
+
+    async def close(self) -> None:
+        """Close the Hermes channel and release the HTTP session."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._close_resources()
+        _LOGGER.debug("Hermes chat session closed")
+
+
+async def test_hermes_login(
+    host: str, port: int, username: str, password: str
+) -> tuple[bool, str]:
+    """Check a Hermes host/username/password without opening a chat.
+
+    Returns (ok, message). Used by the config flow so a typo is caught
+    before the entry is created.
+    """
+    session = aiohttp.ClientSession(trust_env=True)
+    try:
+        # Reachability first: the dashboard answers /api/status.
+        try:
+            async with session.get(
+                f"http://{host}:{int(port)}/api/status",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return False, f"Hermes answered /api/status with {resp.status}"
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            return False, f"Cannot reach Hermes at {host}:{port} ({err})"
+        # Then the login itself.
+        try:
+            async with session.post(
+                f"http://{host}:{int(port)}/auth/password-login",
+                data={"username": username, "password": password},
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status in (200, 302, 303):
+                    return True, "ok"
+                return False, "Hermes rejected the username or password"
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            return False, f"Hermes login failed ({err})"
+    finally:
+        await session.close()

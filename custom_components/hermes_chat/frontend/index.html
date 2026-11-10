@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes Chat</title>
+<link rel="stylesheet" href="/api/hermes_chat/assets/xterm.css">
+<link rel="stylesheet" href="/api/hermes_chat/assets/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🤖 Hermes Chat</div>
+  <div class="actions">
+    <label class="profile-label" for="profile-select">Profile</label>
+    <select id="profile-select" class="profile-select" title="Switch Hermes profile (reconnects the chat)"></select>
+    <span id="status" class="status disconnected">Disconnected</span>
+    <button id="btn-reconnect" class="btn" title="Reconnect the chat">Reconnect</button>
+    <button id="btn-clear" class="btn" title="Clear the screen">Clear</button>
+  </div>
+</header>
+
+<main id="view-chat" class="view">
+  <div id="term-wrap">
+    <div id="term-body"></div>
+  </div>
+  <div id="term-overlay" class="overlay hidden">
+    <div>
+      <p id="overlay-text">Hermes chat closed.</p>
+      <button id="btn-overlay-reconnect" class="btn primary">Reconnect</button>
+    </div>
+  </div>
+</main>
+
+<script src="/api/hermes_chat/assets/xterm.min.js"></script>
+<script src="/api/hermes_chat/assets/addon-fit.js"></script>
+<script src="/api/hermes_chat/assets/app.js"></script>
+</body>
+</html>

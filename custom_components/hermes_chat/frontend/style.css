@@ -1,0 +1,97 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0e14;
+  --panel: #131722;
+  --text: #d6deeb;
+  --muted: #69779a;
+  --accent: #03a9f4;
+  --danger: #ef5350;
+  --border: #1e2532;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 12px;
+  height: 48px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.brand { font-weight: 600; font-size: 15px; white-space: nowrap; }
+.actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.status { font-size: 12px; padding: 3px 8px; border-radius: 10px; }
+.status.connected { color: #26a69a; background: rgba(38, 166, 154, .15); }
+.status.disconnected { color: var(--danger); background: rgba(239, 83, 80, .15); }
+.btn {
+  background: #1c2436;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.profile-label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.profile-select {
+  background: #1c2436;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  cursor: pointer;
+  max-width: 220px;
+}
+.profile-select:disabled { opacity: 0.5; cursor: default; }
+
+.view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; position: relative; }
+.hidden { display: none !important; }
+
+#term-wrap { flex: 1 1 auto; min-height: 0; display: flex; padding: 8px; }
+#term-body { flex: 1 1 auto; min-height: 0; min-width: 0; padding: 4px 0 0 4px; }
+#term-body .xterm { height: 100%; }
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(11, 14, 20, .85);
+  text-align: center;
+  z-index: 5;
+  padding: 0 16px;
+}
+
+/* Narrow screens (phones): let the topbar wrap instead of cutting off
+   the status text and buttons, and hide the status pill — the overlay
+   already shows the connection state. */
+@media (max-width: 640px) {
+  .topbar {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 48px;
+    padding: 6px 8px;
+    row-gap: 6px;
+  }
+  .status { display: none; }
+  .actions { margin-left: 0; }
+  .brand { font-size: 14px; }
+  .profile-select { max-width: 160px; }
+}
