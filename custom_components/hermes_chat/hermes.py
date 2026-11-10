@@ -134,7 +134,15 @@ class HermesSession:
         Raises RuntimeError with a human-readable message when any step
         fails, so the caller can report it to the browser.
         """
-        session = aiohttp.ClientSession(trust_env=True)
+        session = aiohttp.ClientSession(
+            trust_env=True,
+            # Hermes runs on a LAN IP (192.168.2.10), and aiohttp's
+            # default cookie jar REFUSES cookies set by bare IP
+            # addresses. Without unsafe=True the login's session cookie
+            # is silently dropped, so the ws-ticket request goes out
+            # with no cookie and Hermes answers 401 "no_cookie".
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+        )
         self._session = session
         try:
             if not await self._login(session):
@@ -278,7 +286,12 @@ async def fetch_profiles(
     when Hermes cannot be reached or the call fails — the caller then
     falls back to the profiles configured in the integration options.
     """
-    session = aiohttp.ClientSession(trust_env=True)
+    session = aiohttp.ClientSession(
+        trust_env=True,
+        # See HermesSession.start: Hermes is on a LAN IP, so the
+        # default cookie jar would drop its session cookie.
+        cookie_jar=aiohttp.CookieJar(unsafe=True),
+    )
     try:
         # Log in first: /api/profiles needs the session cookie. JSON
         # body with provider "basic" (form data is rejected).
@@ -339,7 +352,12 @@ async def test_hermes_login(
     status code so a rejected login shows up in the HA log instead of
     failing silently.
     """
-    session = aiohttp.ClientSession(trust_env=True)
+    session = aiohttp.ClientSession(
+        trust_env=True,
+        # See HermesSession.start: Hermes is on a LAN IP, so the
+        # default cookie jar would drop its session cookie.
+        cookie_jar=aiohttp.CookieJar(unsafe=True),
+    )
     try:
         # Reachability first: the dashboard answers /api/status.
         try:

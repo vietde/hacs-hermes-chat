@@ -92,6 +92,14 @@ agent at `http://<Hermes host>:8642/v1` with the Hermes API key
 
 ## Version log
 
+- **0.1.4** — session-cookie fix: aiohttp's default cookie jar
+  refuses cookies set by bare IP addresses, so the login's session
+  cookie was silently dropped and the ticket request went out with
+  no cookie (Hermes answered 401 `no_cookie`). The sessions now use
+  `CookieJar(unsafe=True)` so the cookie is kept. The 429 "too many
+  login attempts" in the log was the panel retrying the broken
+  connection, not a wrong password — it clears once the cookie is
+  kept.
 - **0.1.3** — login fix: the Hermes `/auth/password-login`
   endpoint takes a JSON body (`{"provider":"basic","username":…,
   "password":…}`), not form data — the old form post was rejected
