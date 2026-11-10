@@ -5,8 +5,8 @@ over a WebSocket at ``/api/pty``. Authentication is a cookie session
 after a form login, plus a single-use, short-lived ticket minted for
 each WebSocket connection:
 
-  1. ``POST /auth/password-login`` (form: username + password)
-     -> session cookie.
+  1. ``POST /auth/password-login`` (JSON: provider "basic", username,
+     password) -> session cookie.
   2. ``POST /api/auth/ws-ticket`` (with the cookie) -> ``{"ticket": ...}``.
   3. Connect ``ws://<host>:<port>/api/pty?ticket=<ticket>`` (plus
      ``&profile=<name>`` to pick a Hermes profile).
@@ -65,17 +65,30 @@ class HermesSession:
         return f"http://{self._host}:{self._port}"
 
     async def _login(self, session: aiohttp.ClientSession) -> bool:
-        """Log in to Hermes and keep the session cookie in the jar."""
+        """Log in to Hermes and keep the session cookie in the jar.
+
+        The endpoint takes a JSON body — ``{"provider": "basic",
+        "username": ..., "password": ..., "next": "/"}`` — not form
+        data, and ``provider`` is a required field. A good login
+        returns 200 ``{"ok": true}`` and a session cookie; a bad one
+        returns 401 ``Invalid credentials``. Too many attempts from
+        one IP returns 429 (10/minute).
+        """
         url = f"{self._base_url()}/auth/password-login"
         try:
             async with session.post(
                 url,
-                data={"username": self._username, "password": self._password},
+                json={
+                    "provider": "basic",
+                    "username": self._username,
+                    "password": self._password,
+                    "next": "/",
+                },
                 allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
-                # A successful login sets a session cookie and either
-                # returns 200 or redirects (302) to the dashboard.
+                # A successful login returns 200 {"ok": true} (or a
+                # redirect on some versions) and sets a session cookie.
                 _LOGGER.debug("Hermes login: %s -> %s", url, resp.status)
                 if resp.status in (200, 302, 303):
                     return True
@@ -267,11 +280,17 @@ async def fetch_profiles(
     """
     session = aiohttp.ClientSession(trust_env=True)
     try:
-        # Log in first: /api/profiles needs the session cookie.
+        # Log in first: /api/profiles needs the session cookie. JSON
+        # body with provider "basic" (form data is rejected).
         try:
             async with session.post(
                 f"http://{host}:{int(port)}/auth/password-login",
-                data={"username": username, "password": password},
+                json={
+                    "provider": "basic",
+                    "username": username,
+                    "password": password,
+                    "next": "/",
+                },
                 allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
@@ -316,7 +335,9 @@ async def test_hermes_login(
     """Check a Hermes host/username/password without opening a chat.
 
     Returns (ok, message). Used by the config flow so a typo is caught
-    before the entry is created.
+    before the entry is created. Every failure is logged with its
+    status code so a rejected login shows up in the HA log instead of
+    failing silently.
     """
     session = aiohttp.ClientSession(trust_env=True)
     try:
@@ -327,21 +348,53 @@ async def test_hermes_login(
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
+                    _LOGGER.warning(
+                        "Hermes Chat setup: /api/status at %s:%s returned %s",
+                        host,
+                        port,
+                        resp.status,
+                    )
                     return False, f"Hermes answered /api/status with {resp.status}"
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            _LOGGER.warning(
+                "Hermes Chat setup: cannot reach Hermes at %s:%s (%s)", host, port, err
+            )
             return False, f"Cannot reach Hermes at {host}:{port} ({err})"
-        # Then the login itself.
+        # Then the login itself. JSON body with provider "basic"
+        # (form data is rejected with 401).
         try:
             async with session.post(
                 f"http://{host}:{int(port)}/auth/password-login",
-                data={"username": username, "password": password},
+                json={
+                    "provider": "basic",
+                    "username": username,
+                    "password": password,
+                    "next": "/",
+                },
                 allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status in (200, 302, 303):
                     return True, "ok"
-                return False, "Hermes rejected the username or password"
+                body = await resp.text()
+                _LOGGER.warning(
+                    "Hermes Chat setup: login rejected for %s at %s:%s "
+                    "(status=%s body=%s)",
+                    username,
+                    host,
+                    port,
+                    resp.status,
+                    body[:200],
+                )
+                if resp.status == 429:
+                    return False, "Too many login attempts — Hermes rate-limits to 10/minute; wait a minute and try again"
+                if resp.status == 401:
+                    return False, "Hermes rejected the username or password"
+                return False, f"Hermes login failed (status {resp.status})"
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            _LOGGER.warning(
+                "Hermes Chat setup: login request to %s:%s failed (%s)", host, port, err
+            )
             return False, f"Hermes login failed ({err})"
     finally:
         await session.close()

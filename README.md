@@ -92,6 +92,15 @@ agent at `http://<Hermes host>:8642/v1` with the Hermes API key
 
 ## Version log
 
+- **0.1.3** — login fix: the Hermes `/auth/password-login`
+  endpoint takes a JSON body (`{"provider":"basic","username":…,
+  "password":…}`), not form data — the old form post was rejected
+  with 401. The password field is now masked in the setup form, and
+  login failures are logged with their status code (401 wrong
+  credentials, 429 rate-limited to 10/minute) so a rejection shows
+  up in the HA log. The sidebar panel appears once the entry is
+  created (it was missing because the rejected login meant no entry
+  existed).
 - **0.1.2** — OpenAI-compatible API relay for other agents
   (`/v1/models`, `/v1/chat/completions` through HA) + profiles sync
   live from Hermes (`GET /api/profiles`): the switcher lists every

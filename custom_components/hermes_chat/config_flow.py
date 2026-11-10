@@ -5,7 +5,11 @@ from __future__ import annotations
 import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, OptionsFlow
 from homeassistant.core import callback
-from homeassistant.helpers.selector import TextSelector
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 
 from .const import (
     CONF_API_HOST,
@@ -40,7 +44,9 @@ def _schema(defaults: dict) -> vol.Schema:
             vol.Required(
                 CONF_USERNAME, default=defaults.get(CONF_USERNAME, DEFAULT_USERNAME)
             ): TextSelector(),
-            vol.Required(CONF_PASSWORD, default=""): TextSelector(),
+            vol.Required(
+                CONF_PASSWORD, default=defaults.get(CONF_PASSWORD, "")
+            ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
             vol.Required(
                 CONF_PROFILES, default=defaults.get(CONF_PROFILES, DEFAULT_PROFILES)
             ): TextSelector(),
@@ -85,9 +91,12 @@ class HermesChatConfigFlow(ConfigFlow, domain=DOMAIN):
                 ok, message = await test_hermes_login(host, port, username, password)
                 if ok:
                     return self.async_create_entry(title="Hermes Chat", data=user_input)
-                errors["base"] = (
-                    "invalid_auth" if "password" in message or "login" in message.lower() else "cannot_connect"
-                )
+                if "Too many" in message or "rate" in message.lower():
+                    errors["base"] = "rate_limited"
+                elif "password" in message or "credentials" in message:
+                    errors["base"] = "invalid_auth"
+                else:
+                    errors["base"] = "cannot_connect"
         return self.async_show_form(
             step_id="user", data_schema=_schema({}), errors=errors
         )
