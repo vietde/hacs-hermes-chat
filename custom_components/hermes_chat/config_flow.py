@@ -8,12 +8,16 @@ from homeassistant.core import callback
 from homeassistant.helpers.selector import TextSelector
 
 from .const import (
+    CONF_API_HOST,
+    CONF_API_KEY,
+    CONF_API_PORT,
     CONF_DEFAULT_PROFILE,
     CONF_HOST,
     CONF_PASSWORD,
     CONF_PORT,
     CONF_PROFILES,
     CONF_USERNAME,
+    DEFAULT_API_PORT,
     DEFAULT_HOST,
     DEFAULT_PORT,
     DEFAULT_PROFILE,
@@ -44,6 +48,16 @@ def _schema(defaults: dict) -> vol.Schema:
                 CONF_DEFAULT_PROFILE,
                 default=defaults.get(CONF_DEFAULT_PROFILE, DEFAULT_PROFILE),
             ): TextSelector(),
+            # OpenAI-compatible API relay (other agents). Optional: leave
+            # the key empty to disable the relay. The API host defaults
+            # to the same host as the dashboard.
+            vol.Optional(
+                CONF_API_HOST, default=defaults.get(CONF_API_HOST, "")
+            ): TextSelector(),
+            vol.Optional(
+                CONF_API_PORT, default=defaults.get(CONF_API_PORT, DEFAULT_API_PORT)
+            ): int,
+            vol.Optional(CONF_API_KEY, default=""): TextSelector(),
         }
     )
 

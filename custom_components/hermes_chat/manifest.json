@@ -1,1 +1,1 @@
-{"codeowners":[],"config_flow":true,"dependencies":["frontend","panel_custom"],"documentation":"https://github.com/vietde/hacs-hermes-chat","domain":"hermes_chat","integration_type":"service","iot_class":"local_push","name":"Hermes Chat","requirements":[],"version":"0.1.0"}
+{"codeowners":[],"config_flow":true,"dependencies":["frontend","panel_custom"],"documentation":"https://github.com/vietde/hacs-hermes-chat","domain":"hermes_chat","integration_type":"service","iot_class":"local_push","name":"Hermes Chat","requirements":[],"version":"0.1.2"}

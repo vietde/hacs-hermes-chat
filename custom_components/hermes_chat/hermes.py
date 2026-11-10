@@ -254,6 +254,62 @@ class HermesSession:
         _LOGGER.debug("Hermes chat session closed")
 
 
+async def fetch_profiles(
+    host: str, port: int, username: str, password: str
+) -> list[dict] | None:
+    """List the Hermes profiles from the dashboard itself.
+
+    Logs in and calls ``GET /api/profiles``, which returns
+    ``{"profiles": [{"name": ..., "description": ...,
+    "is_default": ...}, ...]}``. Returns the profile list, or None
+    when Hermes cannot be reached or the call fails — the caller then
+    falls back to the profiles configured in the integration options.
+    """
+    session = aiohttp.ClientSession(trust_env=True)
+    try:
+        # Log in first: /api/profiles needs the session cookie.
+        try:
+            async with session.post(
+                f"http://{host}:{int(port)}/auth/password-login",
+                data={"username": username, "password": password},
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status not in (200, 302, 303):
+                    _LOGGER.debug("Hermes profile sync: login failed (%s)", resp.status)
+                    return None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            _LOGGER.debug("Hermes profile sync: login error: %s", err)
+            return None
+        try:
+            async with session.get(
+                f"http://{host}:{int(port)}/api/profiles",
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    _LOGGER.debug("Hermes profile sync: /api/profiles -> %s", resp.status)
+                    return None
+                data = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            _LOGGER.debug("Hermes profile sync: /api/profiles error: %s", err)
+            return None
+        profiles = []
+        for item in (data or {}).get("profiles") or []:
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            profiles.append(
+                {
+                    "name": name,
+                    "description": str(item.get("description") or ""),
+                    "is_default": bool(item.get("is_default")),
+                }
+            )
+        return profiles or None
+    finally:
+        await session.close()
+
+
 async def test_hermes_login(
     host: str, port: int, username: str, password: str
 ) -> tuple[bool, str]:

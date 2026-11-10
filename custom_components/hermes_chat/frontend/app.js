@@ -236,15 +236,29 @@
     var token = getToken();
     var select = document.getElementById("profile-select");
     function fill(list, def) {
-      profiles = list && list.length ? list : [];
+      // Profiles arrive as objects {name, description, is_default}
+      // (synced live from Hermes); older responses may be plain names.
+      profiles = (list && list.length ? list : []).map(function (p) {
+        if (typeof p === "string") return { name: p, description: "" };
+        return { name: p.name || "", description: p.description || "" };
+      }).filter(function (p) { return p.name; });
       select.innerHTML = "";
       profiles.forEach(function (p) {
         var opt = document.createElement("option");
-        opt.value = p;
-        opt.textContent = p;
+        opt.value = p.name;
+        // Show the profile's description next to its name when it has
+        // one, so a long list (cybersecurity-expert, financial-advisor,
+        // …) is readable at a glance.
+        var label = p.name;
+        if (p.description) {
+          var short = p.description.split("\n")[0];
+          if (short.length > 48) short = short.slice(0, 48) + "…";
+          label += " — " + short;
+        }
+        opt.textContent = label;
         select.appendChild(opt);
       });
-      currentProfile = def || profiles[0] || "";
+      currentProfile = def || (profiles[0] && profiles[0].name) || "";
       if (currentProfile) select.value = currentProfile;
       select.disabled = profiles.length <= 1;
     }
@@ -265,7 +279,7 @@
       .catch(function () {
         // Profiles endpoint unavailable (older install?): fall back to
         // the default profile and hide the switcher.
-        fill(["trading-research-assistant", "default"], "trading-research-assistant");
+        fill([{ name: "trading-research-assistant", description: "" }, { name: "default", description: "" }], "trading-research-assistant");
       });
   }
 

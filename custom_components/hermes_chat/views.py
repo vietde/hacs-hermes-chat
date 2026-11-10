@@ -19,22 +19,27 @@ import json
 import logging
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_API_HOST,
+    CONF_API_KEY,
+    CONF_API_PORT,
     CONF_DEFAULT_PROFILE,
     CONF_HOST,
     CONF_PASSWORD,
     CONF_PORT,
     CONF_PROFILES,
     CONF_USERNAME,
+    DEFAULT_API_PORT,
     DEFAULT_PROFILE,
     DEFAULT_PROFILES,
     WS_CLOSE_UNAUTHORIZED,
 )
-from .hermes import HermesSession
+from .hermes import HermesSession, fetch_profiles
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,17 +70,40 @@ def _validate_ws_user(hass: HomeAssistant, request: web.Request):
     return user
 
 
-def _profiles(hass: HomeAssistant) -> tuple[list[str], str]:
-    """Configured Hermes profiles and the default, from the entry."""
+async def _profiles(hass: HomeAssistant) -> tuple[list[dict], str]:
+    """The Hermes profiles, synced live from the dashboard.
+
+    Logs in to Hermes and calls ``GET /api/profiles`` so the switcher
+    always shows the profiles that actually exist (and their
+    descriptions). Falls back to the profiles configured in the
+    integration options when Hermes cannot be reached, so the panel
+    still works offline. Returns (profiles, default_name) where each
+    profile is {"name", "description", "is_default"}.
+    """
     data = hass.data.get("hermes_chat") or {}
+    host = str(data.get(CONF_HOST) or "")
+    try:
+        port = int(data.get(CONF_PORT) or 0)
+    except (TypeError, ValueError):
+        port = 0
+    username = str(data.get(CONF_USERNAME) or "")
+    password = str(data.get(CONF_PASSWORD) or "")
+    if host and port and username and password:
+        live = await fetch_profiles(host, port, username, password)
+        if live:
+            default = next(
+                (p["name"] for p in live if p.get("is_default")), live[0]["name"]
+            )
+            return live, default
+    # Fallback: the configured comma-separated list.
     raw = str(data.get(CONF_PROFILES) or DEFAULT_PROFILES)
-    profiles = [p.strip() for p in raw.split(",") if p.strip()]
-    if not profiles:
-        profiles = [p.strip() for p in DEFAULT_PROFILES.split(",")]
+    names = [p.strip() for p in raw.split(",") if p.strip()]
+    if not names:
+        names = [p.strip() for p in DEFAULT_PROFILES.split(",")]
     default = str(data.get(CONF_DEFAULT_PROFILE) or DEFAULT_PROFILE).strip()
-    if default not in profiles:
-        default = profiles[0]
-    return profiles, default
+    if default not in names:
+        default = names[0]
+    return [{"name": n, "description": "", "is_default": n == default} for n in names], default
 
 
 class HermesChatFrontendView(HomeAssistantView):
@@ -154,7 +182,7 @@ class HermesChatProfilesView(HomeAssistantView):
         self.hass = hass
 
     async def get(self, request: web.Request) -> web.StreamResponse:
-        profiles, default = _profiles(self.hass)
+        profiles, default = await _profiles(self.hass)
         return self.json({"profiles": profiles, "default": default})
 
 
@@ -192,9 +220,10 @@ class HermesChatWebSocketView(HomeAssistantView):
             port = 0
         username = str(data.get(CONF_USERNAME) or "")
         password = str(data.get(CONF_PASSWORD) or "")
-        profiles, default_profile = _profiles(self.hass)
+        profiles, default_profile = await _profiles(self.hass)
+        profile_names = [p["name"] for p in profiles]
         profile = (request.query.get("profile") or "").strip() or default_profile
-        if profile not in profiles:
+        if profile not in profile_names:
             profile = default_profile
         if not host or port < 1 or not username or not password:
             await ws.send_str(
@@ -267,3 +296,156 @@ class HermesChatWebSocketView(HomeAssistantView):
                 await session.close()
             _LOGGER.debug("Hermes Chat: websocket closed for %s", user.name)
         return ws
+
+
+class HermesChatModelsView(HomeAssistantView):
+    """List the Hermes profiles as OpenAI-compatible models.
+
+    Other agents (OpenClaw, Pi, Grok, Muse) point their
+    OpenAI-compatible client at HA and call this to discover which
+    profiles they can use as the `model` in a chat completion.
+    Requires an HA token (long-lived access token as Bearer).
+    """
+
+    url = "/api/hermes_chat/v1/models"
+    name = "hermes_chat:models"
+    requires_auth = True
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self.hass = hass
+
+    async def get(self, request: web.Request) -> web.StreamResponse:
+        profiles, _default = await _profiles(self.hass)
+        return self.json(
+            {
+                "object": "list",
+                "data": [
+                    {
+                        "id": p["name"],
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "hermes",
+                    }
+                    for p in profiles
+                ],
+            }
+        )
+
+
+class HermesChatCompletionsView(HomeAssistantView):
+    """OpenAI-compatible chat completions, relayed to Hermes.
+
+    Lets other agents (OpenClaw, Pi, Grok, Muse) talk to Hermes
+    through Home Assistant instead of reaching the Hermes API server
+    on the LAN directly. The agent points its OpenAI-compatible
+    client at ``https://<HA host>/api/hermes_chat/v1`` with an HA
+    long-lived access token as the Bearer token, and sets `model` to
+    a Hermes profile name (see /v1/models). HA forwards the request
+    to the Hermes API server (port 8642 by default) with the
+    configured Hermes API key.
+
+    Requires the Hermes API server to be running and the API key to
+    be set in the integration options; otherwise returns a clear
+    error instead of a silent failure. Streaming (SSE) and
+    non-streaming requests are both passed through.
+    """
+
+    url = "/api/hermes_chat/v1/chat/completions"
+    name = "hermes_chat:completions"
+    requires_auth = True
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self.hass = hass
+
+    async def post(self, request: web.Request) -> web.StreamResponse:
+        data = self.hass.data.get("hermes_chat") or {}
+        api_host = str(data.get(CONF_API_HOST) or data.get(CONF_HOST) or "")
+        try:
+            api_port = int(data.get(CONF_API_PORT) or DEFAULT_API_PORT)
+        except (TypeError, ValueError):
+            api_port = DEFAULT_API_PORT
+        api_key = str(data.get(CONF_API_KEY) or "")
+        if not api_host or not api_key:
+            return self.json(
+                {
+                    "error": {
+                        "message": (
+                            "Hermes API relay is not configured — set the Hermes "
+                            "API host and API key in the Hermes Chat integration "
+                            "options (Settings → Devices & Services → Hermes Chat → "
+                            "Configure), and make sure the Hermes API server is "
+                            "running (port 8642 by default)."
+                        ),
+                        "type": "configuration_error",
+                    }
+                },
+                status_code=503,
+            )
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return self.json(
+                {"error": {"message": "Request body must be JSON.", "type": "invalid_request"}},
+                status_code=400,
+            )
+        url = f"http://{api_host}:{api_port}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        session = aiohttp.ClientSession(trust_env=True)
+        try:
+            resp = await session.post(
+                url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=600)
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            await session.close()
+            _LOGGER.warning("Hermes API relay: cannot reach %s (%s)", url, err)
+            return self.json(
+                {
+                    "error": {
+                        "message": (
+                            f"Cannot reach the Hermes API server at {api_host}:{api_port} "
+                            f"({err}). Make sure the Hermes API server is running."
+                        ),
+                        "type": "upstream_unreachable",
+                    }
+                },
+                status_code=502,
+            )
+        if body.get("stream"):
+            # Server-sent events: pass the chunks through as they arrive.
+            stream_resp = web.StreamResponse(
+                status=resp.status,
+                headers={
+                    "Content-Type": resp.headers.get("Content-Type", "text/event-stream"),
+                    "Cache-Control": "no-cache",
+                },
+            )
+            await stream_resp.prepare(request)
+            try:
+                async for chunk in resp.content.iter_any():
+                    if chunk:
+                        await stream_resp.write(chunk)
+            except (aiohttp.ClientError, asyncio.CancelledError, ConnectionResetError):
+                pass
+            finally:
+                await resp.release()
+                await session.close()
+            await stream_resp.write_eof()
+            return stream_resp
+        # Non-streaming: read the whole response and return it.
+        try:
+            payload = await resp.json(content_type=None)
+        except ValueError:
+            text = await resp.text()
+            await resp.release()
+            await session.close()
+            return web.Response(
+                status=resp.status,
+                text=text,
+                content_type=resp.headers.get("Content-Type", "application/json"),
+            )
+        await resp.release()
+        await session.close()
+        return self.json(payload, status_code=resp.status)

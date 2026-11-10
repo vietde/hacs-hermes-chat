@@ -27,7 +27,9 @@ from .const import DOMAIN, VERSION
 from .views import (
     ClientLogView,
     HermesChatAssetView,
+    HermesChatCompletionsView,
     HermesChatFrontendView,
+    HermesChatModelsView,
     HermesChatProfilesView,
     HermesChatWebSocketView,
 )
@@ -48,6 +50,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(ClientLogView())
     hass.http.register_view(HermesChatProfilesView(hass))
     hass.http.register_view(HermesChatWebSocketView(hass))
+    hass.http.register_view(HermesChatModelsView(hass))
+    hass.http.register_view(HermesChatCompletionsView(hass))
 
     # Sidebar panel as a custom element (not a plain iframe panel): the
     # element receives the `hass` object from the frontend and passes the
