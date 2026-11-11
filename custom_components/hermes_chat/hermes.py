@@ -64,10 +64,11 @@ class HermesSession:
     def _base_url(self) -> str:
         return f"http://{self._host}:{self._port}"
 
-    async def _login(self, session: aiohttp.ClientSession) -> bool:
+    async def _login(self, session: aiohttp.ClientSession) -> int:
         """Log in to Hermes and keep the session cookie in the jar.
 
-        The endpoint takes a JSON body — ``{"provider": "basic",
+        Returns the HTTP status code (0 on a network error). The
+        endpoint takes a JSON body — ``{"provider": "basic",
         "username": ..., "password": ..., "next": "/"}`` — not form
         data, and ``provider`` is a required field. A good login
         returns 200 ``{"ok": true}`` and a session cookie; a bad one
@@ -91,17 +92,17 @@ class HermesSession:
                 # redirect on some versions) and sets a session cookie.
                 _LOGGER.debug("Hermes login: %s -> %s", url, resp.status)
                 if resp.status in (200, 302, 303):
-                    return True
+                    return resp.status
                 body = await resp.text()
                 _LOGGER.warning(
                     "Hermes login failed: status=%s body=%s",
                     resp.status,
                     body[:200],
                 )
-                return False
+                return resp.status
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("Hermes login error: %s", err)
-            return False
+            return 0
 
     async def _mint_ticket(self, session: aiohttp.ClientSession) -> str | None:
         """Mint a single-use WebSocket ticket (30 s TTL)."""
@@ -145,8 +146,24 @@ class HermesSession:
         )
         self._session = session
         try:
-            if not await self._login(session):
-                raise RuntimeError("Hermes login failed — check host, username and password")
+            login_status = await self._login(session)
+            if login_status not in (200, 302, 303):
+                if login_status == 429:
+                    raise RuntimeError(
+                        "Hermes is rate-limiting logins (too many attempts) — "
+                        "wait a minute and press Reconnect"
+                    )
+                if login_status == 401:
+                    raise RuntimeError(
+                        "Hermes login failed — check host, username and password"
+                    )
+                if login_status == 0:
+                    raise RuntimeError(
+                        "Could not reach Hermes — check the host and port"
+                    )
+                raise RuntimeError(
+                    f"Hermes login failed (status {login_status})"
+                )
             ticket = await self._mint_ticket(session)
             if not ticket:
                 raise RuntimeError("Hermes would not issue a chat ticket — check the Hermes login")
@@ -156,9 +173,11 @@ class HermesSession:
             )
             _LOGGER.debug("Hermes PTY: connecting (profile=%s)", self._profile)
             try:
-                self._ws = await session.ws_connect(
-                    ws_url, timeout=aiohttp.ClientTimeout(total=15)
-                )
+                # No explicit timeout: aiohttp 3.14 deprecates a float
+                # timeout here (and a ClientTimeout trips the same
+                # warning) — the default 10 s handshake timeout is
+                # plenty on the LAN.
+                self._ws = await session.ws_connect(ws_url)
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 raise RuntimeError(f"Could not open the Hermes chat channel: {err}") from err
             _LOGGER.info(

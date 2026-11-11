@@ -92,6 +92,15 @@ agent at `http://<Hermes host>:8642/v1` with the Hermes API key
 
 ## Version log
 
+- **0.1.5** — stop the login retry storm: the profile list is now
+  cached for 5 minutes, so a page load or a chat reconnect no longer
+  logs in to Hermes just to list profiles (that was the extra login
+  per reconnect that pushed Hermes over its 10/minute limit and
+  429'd everything, including the profile sync). A 429 now returns
+  a clear "rate-limiting logins — wait a minute" message and the
+  panel stops auto-reconnecting instead of hammering Hermes and
+  extending the lockout. Also fixed the `timeout` DeprecationWarning
+  on the Hermes WebSocket connect.
 - **0.1.4** — session-cookie fix: aiohttp's default cookie jar
   refuses cookies set by bare IP addresses, so the login's session
   cookie was silently dropped and the ticket request went out with

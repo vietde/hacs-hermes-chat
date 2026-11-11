@@ -27,6 +27,7 @@
   var reconnectTimer = null;
   var keepaliveTimer = null;
   var tokenRefreshTried = false;
+  var rateLimited = false; // set when Hermes 429s the login; stops auto-reconnect
 
   var term = null;
   var fitAddon = null;
@@ -182,7 +183,16 @@
       if (typeof ev.data === "string") {
         try {
           var msg = JSON.parse(ev.data);
-          if (msg.type === "error" && term) term.writeln("\r\n" + msg.message);
+          if (msg.type === "error" && term) {
+            term.writeln("\r\n" + msg.message);
+            // A rate-limit error means Hermes is refusing logins for
+            // a minute — auto-reconnecting would just hammer it again
+            // and extend the lockout, so stop and let the user press
+            // Reconnect once the minute is up.
+            if (/rate-limit|too many/i.test(msg.message || "")) {
+              rateLimited = true;
+            }
+          }
         } catch (e) { /* ignore */ }
         return;
       }
@@ -207,6 +217,11 @@
         showOverlay("Home Assistant session expired. Reload the page and log in again.");
         return;
       }
+      if (rateLimited) {
+        rateLimited = false;
+        showOverlay("Hermes is rate-limiting logins (too many attempts). Wait a minute, then press Reconnect.");
+        return;
+      }
       // Any other close (usually 1006, the network dropping the socket):
       // reconnect automatically a few times instead of leaving a dead
       // chat. A reconnect starts a fresh Hermes session — the old one is
@@ -224,6 +239,7 @@
     wantOpen = true;
     reconnectAttempts = 0;
     tokenRefreshTried = false;
+    rateLimited = false;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (ws) { try { ws.close(); } catch (e) { /* ignore */ } ws = null; }
     hideOverlay();

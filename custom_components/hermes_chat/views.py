@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 
 import aiohttp
@@ -70,17 +71,31 @@ def _validate_ws_user(hass: HomeAssistant, request: web.Request):
     return user
 
 
-async def _profiles(hass: HomeAssistant) -> tuple[list[dict], str]:
+async def _profiles(
+    hass: HomeAssistant, force_refresh: bool = False
+) -> tuple[list[dict], str]:
     """The Hermes profiles, synced live from the dashboard.
 
     Logs in to Hermes and calls ``GET /api/profiles`` so the switcher
     always shows the profiles that actually exist (and their
-    descriptions). Falls back to the profiles configured in the
-    integration options when Hermes cannot be reached, so the panel
-    still works offline. Returns (profiles, default_name) where each
-    profile is {"name", "description", "is_default"}.
+    descriptions). The result is cached for 5 minutes: without the
+    cache, every page load and every chat reconnect would log in to
+    Hermes again, and Hermes rate-limits logins to 10/minute — the
+    panel would 429 itself into a reconnect loop. Falls back to the
+    profiles configured in the integration options when Hermes cannot
+    be reached, so the panel still works offline. Returns (profiles,
+    default_name) where each profile is {"name", "description",
+    "is_default"}.
     """
     data = hass.data.get("hermes_chat") or {}
+    now = time.monotonic()
+    cached = data.get("_profiles_cache") or {}
+    if (
+        not force_refresh
+        and cached.get("profiles")
+        and now - cached.get("fetched_at", 0) < 300
+    ):
+        return cached["profiles"], cached["default"]
     host = str(data.get(CONF_HOST) or "")
     try:
         port = int(data.get(CONF_PORT) or 0)
@@ -94,8 +109,14 @@ async def _profiles(hass: HomeAssistant) -> tuple[list[dict], str]:
             default = next(
                 (p["name"] for p in live if p.get("is_default")), live[0]["name"]
             )
+            data["_profiles_cache"] = {
+                "profiles": live,
+                "default": default,
+                "fetched_at": now,
+            }
             return live, default
-    # Fallback: the configured comma-separated list.
+    # Fallback: the configured comma-separated list. Cache it briefly
+    # too, so a down Hermes does not make every request retry a login.
     raw = str(data.get(CONF_PROFILES) or DEFAULT_PROFILES)
     names = [p.strip() for p in raw.split(",") if p.strip()]
     if not names:
@@ -103,7 +124,13 @@ async def _profiles(hass: HomeAssistant) -> tuple[list[dict], str]:
     default = str(data.get(CONF_DEFAULT_PROFILE) or DEFAULT_PROFILE).strip()
     if default not in names:
         default = names[0]
-    return [{"name": n, "description": "", "is_default": n == default} for n in names], default
+    profiles = [{"name": n, "description": "", "is_default": n == default} for n in names]
+    data["_profiles_cache"] = {
+        "profiles": profiles,
+        "default": default,
+        "fetched_at": now,
+    }
+    return profiles, default
 
 
 class HermesChatFrontendView(HomeAssistantView):
@@ -182,7 +209,8 @@ class HermesChatProfilesView(HomeAssistantView):
         self.hass = hass
 
     async def get(self, request: web.Request) -> web.StreamResponse:
-        profiles, default = await _profiles(self.hass)
+        force = request.query.get("refresh") == "1"
+        profiles, default = await _profiles(self.hass, force_refresh=force)
         return self.json({"profiles": profiles, "default": default})
 
 
