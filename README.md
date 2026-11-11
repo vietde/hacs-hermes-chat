@@ -92,6 +92,23 @@ agent at `http://<Hermes host>:8642/v1` with the Hermes API key
 
 ## Version log
 
+- **0.1.6** — stop the constant refresh and keep the chat history.
+  Two causes, both fixed. (1) Every browser reconnect used to start
+  a brand-new Hermes session and wipe the terminal (`term.reset()`),
+  so the chat "refreshed" and the history vanished on every network
+  drop — and this network drops websockets often. The Hermes session
+  is now persistent per (user, profile): a dropped browser socket
+  no longer kills it, a reconnect re-attaches to the same live
+  session (no new login, the AI keeps its context), and idle
+  sessions are closed only after 30 min with no browser attached.
+  The terminal is never reset on reconnect, scrollback is 5000
+  lines, and reconnects use exponential backoff (2s…30s, up to 10
+  tries) instead of a flat 1 s. The Reconnect button starts a fresh
+  Hermes session (`?fresh=1`) but keeps the old conversation visible
+  as history. (2) A token refresh (~every 30 min) used to open a
+  duplicate socket and a duplicate Hermes session; the panel now
+  only connects when there is no live socket. Server receive timeout
+  raised 120 s → 300 s so a backgrounded tab stays connected.
 - **0.1.5** — stop the login retry storm: the profile list is now
   cached for 5 minutes, so a page load or a chat reconnect no longer
   logs in to Hermes just to list profiles (that was the extra login

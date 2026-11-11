@@ -28,6 +28,7 @@
   var keepaliveTimer = null;
   var tokenRefreshTried = false;
   var rateLimited = false; // set when Hermes 429s the login; stops auto-reconnect
+  var forceFresh = false; // manual Reconnect asks the server for a fresh Hermes session (?fresh=1)
 
   var term = null;
   var fitAddon = null;
@@ -79,7 +80,10 @@
     if (d.type === "hermes-chat-token" && d.token) {
       haToken = d.token;
       report("token-parent");
-      connect();
+      // A token refresh (~every 30 min) posts a new token, but the live
+      // socket is already authenticated — only connect when there is no
+      // live socket, so a refresh does not spawn a duplicate session.
+      if (!ws || ws.readyState !== WebSocket.OPEN) connect();
     }
   });
 
@@ -123,17 +127,23 @@
 
   function scheduleReconnect() {
     if (!wantOpen) return;
-    if (reconnectAttempts >= 5) {
+    if (reconnectAttempts >= 10) {
       setStatus("disconnected", "Disconnected");
       showOverlay("Hermes chat disconnected. Reconnect to try again.");
       return;
     }
     reconnectAttempts += 1;
     setStatus("disconnected", "Reconnecting…");
+    // Exponential backoff (2s, 4s, 8s, 15s, 30s, …): a flaky network
+    // used to reconnect after a flat 1 s, hammering Hermes with a fresh
+    // login on every drop. The Hermes session now persists server-side,
+    // so a reconnect just re-attaches to it — no new login — and the
+    // terminal is NOT reset, so the chat history stays on screen
+    // through a drop instead of the panel appearing to "refresh".
+    var delay = Math.min(30000, 2000 * Math.pow(2, reconnectAttempts - 1));
     reconnectTimer = setTimeout(function () {
-      if (term) term.reset();
       connect();
-    }, 1000);
+    }, delay);
   }
 
   function connect() {
@@ -161,10 +171,16 @@
     }
     tokenWaitedMs = 0;
     if (!haToken) report("token-storage");
+    // Don't open a second socket while one is already live (a token
+    // refresh posts a new token every ~30 min; the live socket is
+    // already authenticated and must not be replaced).
+    if (ws && ws.readyState === WebSocket.OPEN) return;
     setStatus("disconnected", "Connecting…");
     hideOverlay();
     var url = WS_BASE + "/api/hermes_chat/ws?token=" + encodeURIComponent(token);
     if (currentProfile) url += "&profile=" + encodeURIComponent(currentProfile);
+    if (forceFresh) url += "&fresh=1";
+    forceFresh = false;
     var socket = new WebSocket(url);
     ws = socket;
     socket.binaryType = "arraybuffer";
@@ -223,9 +239,10 @@
         return;
       }
       // Any other close (usually 1006, the network dropping the socket):
-      // reconnect automatically a few times instead of leaving a dead
-      // chat. A reconnect starts a fresh Hermes session — the old one is
-      // gone with the socket — so the terminal is reset first.
+      // reconnect automatically with backoff instead of leaving a dead
+      // chat. The Hermes session persists server-side and the terminal
+      // is NOT reset, so the chat resumes on the same session and the
+      // history stays visible — no more "refresh" on every drop.
       scheduleReconnect();
     };
     socket.onerror = function () {
@@ -240,10 +257,13 @@
     reconnectAttempts = 0;
     tokenRefreshTried = false;
     rateLimited = false;
+    forceFresh = true; // manual Reconnect starts a fresh Hermes session
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (ws) { try { ws.close(); } catch (e) { /* ignore */ } ws = null; }
     hideOverlay();
-    if (term) term.reset();
+    // The terminal is NOT reset: the old conversation stays visible as
+    // history, and the fresh session's output appends below it. Use
+    // Clear to blank the screen.
     connect();
   }
 
@@ -331,6 +351,7 @@
     fontFamily: 'ui-monospace, "Cascadia Mono", Consolas, monospace',
     theme: { background: "#0b0e14", foreground: "#d6deeb" },
     allowProposedApi: true,
+    scrollback: 5000, // keep a long history on screen across reconnects
   });
   fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);

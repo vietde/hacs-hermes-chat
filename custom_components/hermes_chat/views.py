@@ -230,10 +230,11 @@ class HermesChatWebSocketView(HomeAssistantView):
         # HA connections too), so a server ping whose pong never comes
         # back would kill a live chat. Instead the browser sends an
         # application-level {"type":"ping"} every 5 s (answered with
-        # {"type":"pong"}). The 120 s receive timeout only cleans up
+        # {"type":"pong"}). The 300 s receive timeout only cleans up
         # truly dead peers: a live client pings every 5 s and never trips
-        # it.
-        ws = web.WebSocketResponse(heartbeat=None, receive_timeout=120)
+        # it, and a backgrounded tab whose timers are throttled still
+        # pings well inside 5 minutes.
+        ws = web.WebSocketResponse(heartbeat=None, receive_timeout=300)
         await ws.prepare(request)
         user = _validate_ws_user(self.hass, request)
         if user is None:
@@ -266,39 +267,95 @@ class HermesChatWebSocketView(HomeAssistantView):
             return ws
 
         loop = asyncio.get_running_loop()
+        # Persistent chat sessions: one Hermes PTY session per
+        # (user, profile), kept alive in hass.data across browser
+        # reconnects. The browser<->HA socket drops whenever the
+        # network hiccups, but the HA<->Hermes leg runs on the LAN
+        # and stays up — so a dropped browser socket must NOT kill
+        # the Hermes session (that was the old behaviour, and it is
+        # why the chat kept "refreshing" and losing its history: every
+        # reconnect started a brand-new Hermes session and the
+        # terminal was reset). A reconnect now re-attaches to the
+        # live session, so the AI keeps its context and the chat
+        # stays stable for as long as the session lives. Sessions
+        # with no browser attached for > 30 min are closed.
+        sessions = data.setdefault("_chat_sessions", {})
+        key = (user.id, profile)
+        now = time.monotonic()
+        for old_key, old_rec in list(sessions.items()):
+            if old_rec.get("browser") is None and now - old_rec.get("last_seen", 0) > 1800:
+                old_session = old_rec.get("session")
+                if old_session is not None:
+                    try:
+                        await old_session.close()
+                    except Exception:  # noqa: BLE001 - already closing
+                        pass
+                sessions.pop(old_key, None)
+        # A manual Reconnect asks for a fresh Hermes session (?fresh=1).
+        if request.query.get("fresh") == "1":
+            old_rec = sessions.pop(key, None)
+            if old_rec is not None and old_rec.get("session") is not None:
+                try:
+                    await old_rec["session"].close()
+                except Exception:  # noqa: BLE001 - already closing
+                    pass
+
         session: HermesSession | None = None
+        rec = sessions.get(key)
+        if rec is not None and not rec["session"].closed:
+            # Re-attach: the AI keeps its context; the browser just
+            # resumes receiving output on the same Hermes session.
+            session = rec["session"]
+            rec["browser"] = ws
+            rec["last_seen"] = now
+            _LOGGER.debug("Hermes Chat: re-attached to live session (profile=%s)", profile)
+        else:
+            # No live session: start one. Its output dispatcher forwards
+            # to whichever browser is currently attached to this
+            # (user, profile), so a later browser reconnect resumes the
+            # same Hermes conversation instead of starting a new one.
+            async def _send_bytes(bws: web.WebSocketResponse, payload: bytes) -> None:
+                try:
+                    await bws.send_bytes(payload)
+                except Exception:  # noqa: BLE001 - peer gone
+                    pass
 
-        def _on_output(payload: bytes) -> None:
-            if not ws.closed:
-                asyncio.ensure_future(_safe_send(payload))
+            def _dispatch(payload: bytes) -> None:
+                cur = sessions.get(key)
+                bws = cur.get("browser") if cur else None
+                if bws is not None and not bws.closed:
+                    asyncio.ensure_future(_send_bytes(bws, payload))
 
-        async def _safe_send(payload: bytes) -> None:
+            def _on_exit(_code) -> None:
+                # Hermes closed the PTY: drop the session so the next
+                # browser connection starts a fresh one, and tell the
+                # attached browser (if any) that the chat ended.
+                cur = sessions.pop(key, None)
+                bws = cur.get("browser") if cur else None
+                if bws is not None and not bws.closed:
+                    asyncio.ensure_future(
+                        _send_bytes(bws, b"\r\n[Hermes chat closed]\r\n")
+                    )
+
             try:
-                await ws.send_bytes(payload)
-            except Exception:  # noqa: BLE001 - peer gone
-                pass
-
-        def _on_exit(_code) -> None:
-            if not ws.closed:
-                asyncio.ensure_future(_safe_send(b"\r\n[Hermes chat closed]\r\n"))
-
-        try:
-            session = HermesSession(
-                loop, host, port, username, password, profile, _on_output, on_exit=_on_exit
-            )
-            await session.start()
-        except RuntimeError as err:
-            _LOGGER.warning("Hermes Chat: could not start session: %s", err)
-            await ws.send_str(json.dumps({"type": "error", "message": str(err)}))
-            await ws.close()
-            return ws
-        except Exception as err:  # noqa: BLE001 - report to the browser
-            _LOGGER.warning("Hermes Chat: could not start session: %s", err)
-            await ws.send_str(
-                json.dumps({"type": "error", "message": f"Could not start Hermes chat: {err}"})
-            )
-            await ws.close()
-            return ws
+                session = HermesSession(
+                    loop, host, port, username, password, profile, _dispatch, on_exit=_on_exit
+                )
+                await session.start()
+            except RuntimeError as err:
+                _LOGGER.warning("Hermes Chat: could not start session: %s", err)
+                await ws.send_str(json.dumps({"type": "error", "message": str(err)}))
+                await ws.close()
+                return ws
+            except Exception as err:  # noqa: BLE001 - report to the browser
+                _LOGGER.warning("Hermes Chat: could not start session: %s", err)
+                await ws.send_str(
+                    json.dumps({"type": "error", "message": f"Could not start Hermes chat: {err}"})
+                )
+                await ws.close()
+                return ws
+            sessions[key] = {"session": session, "browser": ws, "last_seen": now}
+            _LOGGER.debug("Hermes Chat: started new session (profile=%s)", profile)
 
         _LOGGER.debug("Hermes Chat: websocket opened for %s (profile=%s)", user.name, profile)
         try:
@@ -320,8 +377,15 @@ class HermesChatWebSocketView(HomeAssistantView):
                 elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
                     break
         finally:
-            if session is not None:
-                await session.close()
+            # Detach the browser but KEEP the Hermes session alive: the
+            # AI conversation survives a dropped browser socket, and the
+            # next connection re-attaches to it. The session is closed
+            # only when Hermes ends it (on_exit), on a manual fresh
+            # Reconnect, or after 30 min with no browser attached.
+            cur = sessions.get(key)
+            if cur is not None and cur.get("browser") is ws:
+                cur["browser"] = None
+                cur["last_seen"] = time.monotonic()
             _LOGGER.debug("Hermes Chat: websocket closed for %s", user.name)
         return ws
 
